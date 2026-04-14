@@ -2,3 +2,13 @@
 __pycache__/
 *.pyc
 *.pyo
+
+# Runtime data — updated continuously by the bot, not source code
+logs/
+weatherbot/data/markets/
+weatherbot/data/state.json
+weatherbot/data/adaptive_config.json
+polymarket-trading-bot/bridge_state.json
+
+# IDE / local tooling
+.claude/
