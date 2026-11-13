@@ -1,26 +1,26 @@
 import asyncio
 import os
 from pathlib import Path
-from mcp.server.models import InitializationOptions
-from mcp.server import NotificationOptions, Server
-from mcp.server.stdio import stdio_server
-from mcp import types
-from google import genai
-from google.genai import types as genai_types
+from typing import Literal
+
+import httpx
 from dotenv import load_dotenv
+from google import genai
+from google.genai import errors as genai_errors
+from google.genai import types as genai_types
+from mcp.server import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 # Load .env from same directory as this script
 load_dotenv(Path(__file__).parent / ".env")
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
-    raise RuntimeError(
-        "GEMINI_API_KEY not set. Run setup.py to configure your API key."
-    )
+    raise RuntimeError("GEMINI_API_KEY not set. Run configure.py to configure your API key.")
 
-MODEL = "gemini-2.5-flash"
+MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
 client = genai.Client(api_key=GEMINI_API_KEY)
-server = Server("gemini-research-mcp")
+mcp = MCPServer("gemini-research-mcp", version="1.1.0")
 
 SYSTEM_PROMPT = (
     "You are a research assistant. Summarize the topic accurately and evenhandedly. "
@@ -28,116 +28,85 @@ SYSTEM_PROMPT = (
     "Do not pad the response — match length to complexity."
 )
 
-
-@server.list_tools()
-async def handle_list_tools() -> list[types.Tool]:
-    return [
-        types.Tool(
-            name="research",
-            description=(
-                "Search the web and return a factual summary of a topic. "
-                "Use for anything past Claude's knowledge cutoff or current events."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "What to research",
-                    },
-                    "detail": {
-                        "type": "string",
-                        "enum": ["low", "normal", "high"],
-                        "description": "Summary length: low=~500w, normal=~1500w, high=~3000w",
-                        "default": "normal",
-                    },
-                },
-                "required": ["query"],
-            },
-        ),
-        types.Tool(
-            name="research_url",
-            description="Fetch and summarize a specific URL.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "url": {
-                        "type": "string",
-                        "description": "URL to fetch and summarize",
-                    },
-                    "detail": {
-                        "type": "string",
-                        "enum": ["low", "normal", "high"],
-                        "description": "Summary length: low=~500w, normal=~1500w, high=~3000w",
-                        "default": "normal",
-                    },
-                },
-                "required": ["url"],
-            },
-        ),
-    ]
+Detail = Literal["low", "normal", "high"]
+WORDS = {"low": "~300", "normal": "~800", "high": "~2000"}
 
 
-def detail_to_words(detail: str) -> str:
-    return {"low": "~500", "normal": "~1500", "high": "~3000"}.get(detail, "~1500")
-
-
-@server.call_tool()
-async def handle_call_tool(name: str, arguments: dict) -> list[types.TextContent]:
-    detail = arguments.get("detail", "normal")
-    words = detail_to_words(detail)
-
-    if name == "research":
-        query = arguments["query"]
-        prompt = (
-            f"{SYSTEM_PROMPT}\n\n"
-            f"Research the following topic using Google Search and write a summary of approximately {words} words:\n\n"
-            f"{query}"
-        )
-        response = client.models.generate_content(
+async def generate(prompt: str, tool: genai_types.Tool) -> genai_types.GenerateContentResponse:
+    try:
+        return await client.aio.models.generate_content(
             model=MODEL,
             contents=prompt,
-            config=genai_types.GenerateContentConfig(
-                tools=[genai_types.Tool(google_search=genai_types.GoogleSearch())],
-            ),
+            config=genai_types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT, tools=[tool]),
         )
-        return [types.TextContent(type="text", text=response.text)]
-
-    elif name == "research_url":
-        url = arguments["url"]
-        prompt = (
-            f"{SYSTEM_PROMPT}\n\n"
-            f"Fetch the content at the following URL and write a summary of approximately {words} words:\n\n"
-            f"{url}"
-        )
-        response = client.models.generate_content(
-            model=MODEL,
-            contents=prompt,
-            config=genai_types.GenerateContentConfig(
-                tools=[genai_types.Tool(google_search=genai_types.GoogleSearch())],
-            ),
-        )
-        return [types.TextContent(type="text", text=response.text)]
-
-    else:
-        return [types.TextContent(type="text", text=f"Unknown tool: {name}")]
+    except genai_errors.APIError as e:
+        raise ToolError(f"Gemini API error {e.code}: {e.message}") from e
 
 
-async def main():
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(
-            read_stream,
-            write_stream,
-            InitializationOptions(
-                server_name="gemini-research-mcp",
-                server_version="1.0.0",
-                capabilities=server.get_capabilities(
-                    notification_options=NotificationOptions(),
-                    experimental_capabilities={},
-                ),
-            ),
-        )
+def response_text(response: genai_types.GenerateContentResponse) -> str:
+    if not response.text:
+        reason = response.candidates[0].finish_reason if response.candidates else "no candidates"
+        raise ToolError(f"Gemini returned no text (finish reason: {reason}).")
+    return response.text
+
+
+async def resolve_redirect(http: httpx.AsyncClient, uri: str) -> str:
+    """Resolve a grounding redirect link to the target URL; keep the link if that fails."""
+    try:
+        response = await http.head(uri)
+    except httpx.HTTPError:
+        return uri
+    return response.headers.get("location", uri) if response.is_redirect else uri
+
+
+async def sources(response: genai_types.GenerateContentResponse) -> str:
+    """Format the grounding sources as a Markdown list, deduplicated by target URL."""
+    candidate = response.candidates[0] if response.candidates else None
+    metadata = candidate.grounding_metadata if candidate else None
+    webs = [c.web for c in (metadata.grounding_chunks if metadata else None) or [] if c.web and c.web.uri]
+    if not webs:
+        return ""
+    async with httpx.AsyncClient(timeout=5) as http:
+        urls = await asyncio.gather(*(resolve_redirect(http, web.uri) for web in webs))
+    seen = {}
+    for web, url in zip(webs, urls):
+        seen.setdefault(url, web.title or url)
+    return "\n\n**Sources:**\n" + "\n".join(f"- [{title}]({url})" for url, title in seen.items())
+
+
+@mcp.tool(structured_output=False)
+async def research(query: str, detail: Detail = "low") -> str:
+    """Search the web and return a factual summary of a topic, with sources.
+
+    Use for anything past Claude's knowledge cutoff or current events.
+    detail controls summary length: low=~300 words, normal=~800, high=~2000.
+    """
+    response = await generate(
+        f"Research the following topic using Google Search and write a summary of "
+        f"approximately {WORDS[detail]} words:\n\n{query}",
+        genai_types.Tool(google_search=genai_types.GoogleSearch()),
+    )
+    return response_text(response) + await sources(response)
+
+
+@mcp.tool(structured_output=False)
+async def research_url(url: str, detail: Detail = "low") -> str:
+    """Fetch a specific URL and summarize its content.
+
+    detail controls summary length: low=~300 words, normal=~800, high=~2000.
+    """
+    response = await generate(
+        f"Summarize the content of the following URL in approximately {WORDS[detail]} words:\n\n{url}",
+        genai_types.Tool(url_context=genai_types.UrlContext()),
+    )
+    # Without a successful retrieval Gemini would summarize from guesswork
+    candidate = response.candidates[0] if response.candidates else None
+    url_metadata = candidate.url_context_metadata if candidate else None
+    statuses = [m.url_retrieval_status for m in (url_metadata.url_metadata if url_metadata else None) or []]
+    if genai_types.UrlRetrievalStatus.URL_RETRIEVAL_STATUS_SUCCESS not in statuses:
+        raise ToolError(f"Could not retrieve {url} (status: {statuses or 'unknown'}).")
+    return response_text(response)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    mcp.run()

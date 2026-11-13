@@ -1,0 +1,18 @@
+[project]
+name = "gemini-research-mcp"
+version = "1.1.0"
+description = "Local MCP server for web research via Gemini with Google Search grounding"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp (>=2.3,<3)",
+    "google-genai (>=1.20,<2)",
+    "python-dotenv (>=1.0,<2)",
+    "httpx (>=0.28,<1)",
+]
+
+[tool.poetry]
+package-mode = false
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
